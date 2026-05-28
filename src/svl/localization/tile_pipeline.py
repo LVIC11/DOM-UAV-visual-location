@@ -115,6 +115,7 @@ class TilePipeline(BasePipeline):
 
         max_macthes = -1
         best_dst = None
+        best_denormalized_center = None
         matched_image = None
         is_match = False
         predicted_coordinates = None
@@ -126,6 +127,7 @@ class TilePipeline(BasePipeline):
         matched_confidence = None
         matched_valid = None
         matched_inliers = None
+        saved_kpts1 = None
 
         drone_image.key_points = self.detector.detect_and_describe_keypoints(
             drone_image.image
@@ -155,14 +157,20 @@ class TilePipeline(BasePipeline):
                 )
                 continue
 
-            ret, num_inliers, dst = self.estimate_and_apply_geometric_transform(
+            ret, num_inliers, dst, H = self.estimate_and_apply_geometric_transform(
                 mkpts0, mkpts1, drone_image.image.shape[:2]
             )
 
             if ret and len(mkpts1) > max_macthes:
 
                 max_macthes = len(mkpts1)
-                denormalized_center = self.compute_center(dst)
+                h, w = drone_image.image.shape[:2]
+                center_pt = np.float32([[[w / 2, h / 2]]])
+                denormalized_center_pt = cv2.perspectiveTransform(center_pt, H)[0][0]
+                denormalized_center = (
+                    int(denormalized_center_pt[0]),
+                    int(denormalized_center_pt[1]),
+                )
                 center = self.normalize_center(
                     denormalized_center, satellite_image.image.shape
                 )
@@ -170,6 +178,7 @@ class TilePipeline(BasePipeline):
                     continue
 
                 best_dst = dst
+                best_denormalized_center = denormalized_center
                 matched_image = satellite_image
                 features_mean = np.mean(mkpts0, axis=0)
                 matched_kpts0 = mkpts0
@@ -177,21 +186,7 @@ class TilePipeline(BasePipeline):
                 matched_confidence = confidence
                 matched_valid = valid
                 matched_inliers = num_inliers
-
-                # viz dron image
-                viz_satellite_image = satellite_image.image.copy()
-                viz_satellite_image = self.draw_transform_polygon_on_image(
-                    viz_satellite_image, dst
-                )
-                viz_satellite_image = self.draw_center(
-                    viz_satellite_image, denormalized_center
-                )
-
-                # viz satellite image
-                viz_drone_image = drone_image.image.copy()
-                viz_drone_image = self.draw_center(
-                    viz_drone_image, (int(features_mean[0]), int(features_mean[1]))
-                )
+                saved_kpts1 = satellite_image.key_points.keypoints
 
         if best_dst is not None:
             predicted_coordinates = self.compute_geo_pose(matched_image, center)
@@ -203,22 +198,65 @@ class TilePipeline(BasePipeline):
                     Path(output_path) if isinstance(output_path, str) else output_path
                 )
                 viz_path = output_path / f"{drone_image.name}_viz.jpg"
+
+                # Draw white polygon on grayscale satellite image
+                viz_satellite_image = matched_image.image.copy()
+                viz_satellite_image = self.draw_transform_polygon_on_image(
+                    viz_satellite_image, best_dst
+                )
+
+                # Build matching plot from raw grayscale images
+                viz_drone_image = drone_image.image.copy()
                 out = make_matching_plot_fast(
                     image0=viz_drone_image,
                     image1=viz_satellite_image,
                     kpts0=drone_image.key_points.keypoints,
-                    kpts1=matched_image.key_points.keypoints,
+                    kpts1=saved_kpts1,
                     mkpts0=matched_kpts0,
                     mkpts1=matched_kpts1,
                     color=color,
                     text="",
                     path=None,
                     show_keypoints=True,
-                    small_text=[
-                        f"GT: {gt_coordinates}",
-                        f"Pred: {predicted_coordinates}",
-                    ],
+                    small_text=[],
                 )
+
+                # Draw colored annotations on the BGR canvas
+                margin = 10
+                W0 = drone_image.image.shape[1]
+
+                # Features mean on drone image (magenta ring)
+                cx_d = int(features_mean[0])
+                cy_d = int(features_mean[1])
+                cv2.circle(out, (cx_d, cy_d), 10, (255, 0, 255), 5, lineType=cv2.LINE_AA)
+
+                # Predicted look-at point on satellite image (magenta ring)
+                cx_s, cy_s = best_denormalized_center
+                cv2.circle(
+                    out, (cx_s + margin + W0, cy_s), 10,
+                    (255, 0, 255), 5, lineType=cv2.LINE_AA,
+                )
+
+                # Ground truth GPS point on satellite image (green ring)
+                gt_pixel = self.gps_to_pixel(gt_coordinates, matched_image)
+                cv2.circle(
+                    out, (gt_pixel[0] + margin + W0, gt_pixel[1]), 10,
+                    (0, 255, 0), 5, lineType=cv2.LINE_AA,
+                )
+
+                # Draw text overlay
+                small_text = [
+                    f"GT: {gt_coordinates}",
+                    f"Pred: {predicted_coordinates}",
+                    f"Dist: {distance*1000:.2f}m",
+                ]
+                Ht = int(min(out.shape[0] / 640., 2.0) * 30)
+                for i, t in enumerate(small_text):
+                    cv2.putText(out, t, (8, Ht*(i+1)), cv2.FONT_HERSHEY_DUPLEX,
+                                0.8, (0, 0, 0), 2, cv2.LINE_AA)
+                    cv2.putText(out, t, (8, Ht*(i+1)), cv2.FONT_HERSHEY_DUPLEX,
+                                0.8, (255, 255, 255), 1, cv2.LINE_AA)
+
                 cv2.imwrite(str(viz_path), out)
             self.logger.info(
                 f"Predicted coordinates: {predicted_coordinates}, GT coordinates: {gt_coordinates}"

@@ -307,7 +307,7 @@ class TileSatelliteMapReader(BaseMapReader):
                 img_idx += 1
         self._num_images = img_idx
         self.logger.info(
-            f"Image database built successfully with {self.num_images} images"
+            f"Image database built successfully with {self._num_images} images"
         )
 
         top_left_tile = self.get_top_left_tile()

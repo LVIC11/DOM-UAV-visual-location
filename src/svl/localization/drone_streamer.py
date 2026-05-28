@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import Union
+from typing import List, Union
 
 import cv2
 import numpy as np
@@ -72,7 +72,7 @@ class DroneImageStreamer:
         return new_streamer
 
     @property
-    def image_names(self) -> list[str]:
+    def image_names(self) -> List[str]:
         """List of image names in the streamer."""
         return list(self._image_db.keys())
 
@@ -124,8 +124,29 @@ class DroneImageStreamer:
         csv_file = csv_files[0]
         self.logger.info(f"Building image database with GT from {csv_file}")
         self._metadata = pd.read_csv(csv_file)
+        has_orientation = all(
+            col in self._metadata.columns
+            for col in ["Gimball_Pitch", "Gimball_Roll", "Gimball_Yaw"]
+        )
         for _, row in tqdm(self._metadata.iterrows(), total=len(self._metadata)):
             image_path = self.image_folder / row["Filename"]
+            camera_orient = None
+            drone_orient = None
+            if has_orientation:
+                camera_orient = Orientation(
+                    pitch=row["Gimball_Pitch"],
+                    roll=row["Gimball_Roll"],
+                    yaw=row["Gimball_Yaw"],
+                )
+                if all(
+                    col in self._metadata.columns
+                    for col in ["Flight_Pitch", "Flight_Roll", "Flight_Yaw"]
+                ):
+                    drone_orient = Orientation(
+                        pitch=row["Flight_Pitch"],
+                        roll=row["Flight_Roll"],
+                        yaw=row["Flight_Yaw"],
+                    )
             drone_image = DroneImage(
                 image_path=image_path,
                 geo_point=GeoPoint(
@@ -133,16 +154,8 @@ class DroneImageStreamer:
                     longitude=row["Longitude"],
                     altitude=row["Altitude"],
                 ),
-                camera_orientation=Orientation(
-                    pitch=row["Gimball_Pitch"],
-                    roll=row["Gimball_Roll"],
-                    yaw=row["Gimball_Yaw"],
-                ),
-                drone_orientation=Orientation(
-                    pitch=row["Flight_Pitch"],
-                    roll=row["Flight_Roll"],
-                    yaw=row["Flight_Yaw"],
-                ),
+                camera_orientation=camera_orient,
+                drone_orientation=drone_orient,
             )
             self._image_db[image_path.name] = drone_image
             self._num_images += 1

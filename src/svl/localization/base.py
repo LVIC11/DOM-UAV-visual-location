@@ -279,7 +279,7 @@ class BasePipeline:
 
     def estimate_and_apply_geometric_transform(
         self, mkpts0: np.ndarray, mkpts1: np.ndarray, image_shape: Tuple[int, int]
-    ) -> Tuple[bool, float, np.ndarray]:
+    ) -> Tuple[bool, float, np.ndarray, Optional[np.ndarray]]:
         """Estimate and apply a geometric transform between two sets of matched keypoints.
 
         Parameters
@@ -295,14 +295,17 @@ class BasePipeline:
         -------
         bool
             Whether the geometric transform was estimated and applied successfully.
-        np.ndarray [shape=(4, 1, 2)]
-            Transformed corners if the transform was applied successfully, None otherwise.
         float
             Number of inliers.
+        np.ndarray [shape=(4, 1, 2)]
+            Transformed corners if the transform was applied successfully, None otherwise.
+        Optional[np.ndarray]
+            The homography matrix (3x3), or None if estimation failed.
         """
         success = False
         transformed_corners = None
         num_inliers = 0
+        transformation_matrix = None
 
         try:
             transformation_matrix, mask = cv2.findHomography(
@@ -329,7 +332,7 @@ class BasePipeline:
                 f"Failed to estimate and apply the geometric transform: {e}"
             )
 
-        return success, num_inliers, transformed_corners if success else None
+        return success, num_inliers, transformed_corners if success else None, transformation_matrix
 
     def compute_geo_pose(
         self, satellite_image: GeoSatelliteImage, matching_center: Tuple[int, int]
@@ -363,6 +366,34 @@ class BasePipeline:
         )
 
         return GpsCoordinate(lat=latitude, long=longitude)
+
+    def gps_to_pixel(
+        self,
+        gps_coordinate: GpsCoordinate,
+        satellite_image: GeoSatelliteImage,
+    ) -> Tuple[int, int]:
+        """Convert a GPS coordinate to a pixel position on the satellite image.
+
+        Parameters
+        ----------
+        gps_coordinate : GpsCoordinate
+            the GPS coordinate to convert
+        satellite_image : GeoSatelliteImage
+            the georeferenced satellite image
+
+        Returns
+        -------
+        Tuple[int, int]
+            the (x, y) pixel coordinate on the satellite image
+        """
+        h, w = satellite_image.image.shape[:2]
+        norm_x = (gps_coordinate.long - satellite_image.top_left.long) / (
+            satellite_image.bottom_right.long - satellite_image.top_left.long
+        )
+        norm_y = (gps_coordinate.lat - satellite_image.top_left.lat) / (
+            satellite_image.bottom_right.lat - satellite_image.top_left.lat
+        )
+        return int(norm_x * w), int(norm_y * h)
 
     def save_viz(self, image: np.ndarray, output_path: Union[str, Path]) -> None:
         """Save the image to the output path.
@@ -415,7 +446,7 @@ class BasePipeline:
         total_distance = 0
         for pred in preds:
             num_matches += pred["is_match"]
-            total_distance += pred["distance"] if pred["is_match"] else 0
+            total_distance += (pred["distance"] or 0) if pred["is_match"] else 0
         return {
             "num_matches": num_matches,
             "mae": total_distance / num_matches if num_matches > 0 else 0,
@@ -506,7 +537,7 @@ class BasePipeline:
         cx, cy = center
         return cx / image_shape[1], cy / image_shape[0]
 
-    def draw_center(self, image: np.ndarray, center: Tuple[int, int]) -> np.ndarray:
+    def draw_center(self, image: np.ndarray, center: Tuple[int, int], color: Tuple[int, int, int] = (255, 0, 255)) -> np.ndarray:
         """Draw the center of the affine transform on the image.
 
         Parameters
@@ -515,6 +546,8 @@ class BasePipeline:
             an ndarray representing the image
         center : Tuple[int, int]
             the center of the affine transform
+        color : Tuple[int, int, int]
+            the BGR color of the circle, default magenta (255, 0, 255)
 
         Returns
         -------
@@ -526,7 +559,7 @@ class BasePipeline:
             image,
             (cx, cy),
             radius=10,
-            color=(255, 0, 255),
+            color=color,
             thickness=5,
         )
         return image
