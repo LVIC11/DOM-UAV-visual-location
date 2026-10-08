@@ -12,6 +12,7 @@ from superglue_lib.models.utils import process_resize
 from svl.keypoint_pipeline.base import CombinedKeyPointAlgorithm, KeyPointMatcher
 from svl.keypoint_pipeline.typing import ImageKeyPoints
 from svl.localization.drone_streamer import DroneImageStreamer
+from svl.localization.geometry import CameraCalibration
 from svl.localization.preprocessing import QueryProcessor
 from svl.tms.data_structures import DroneImage, GeoSatelliteImage
 from svl.tms.schemas import GpsCoordinate
@@ -32,6 +33,22 @@ class PipelineConfig:
     homography_threshold: float = 5.0
     homography_confidence: float = 0.995
     homography_max_iter: int = 2000
+    use_centroid: bool = False  # If True, use keypoint centroid instead of image center
+    query_rotation_cw: float = 0.0  # Clockwise rotation already applied to query images.
+    query_rotation_by_name: Dict[str, float] = field(default_factory=dict)
+    camera_calibration: Optional[CameraCalibration] = None
+    reference_latitude: float = 31.8325939032
+    reference_longitude: float = 118.71416416
+    pnp_min_inliers: int = 20
+    pnp_min_inlier_ratio: float = 0.35
+    pnp_ransac_threshold_px: float = 6.0
+    pnp_min_bbox_area_ratio: float = 0.03
+    pnp_min_camera_height_m: float = 5.0
+    pnp_max_camera_height_m: float = 1000.0
+    pnp_max_optical_tilt_deg: float = 30.0
+    pnp_tilt_regularization_px_per_deg: float = 0.05
+    use_gt_tile_prior: bool = False
+    gt_tile_prior_radius_m: float = 150.0
 
 
 class BaseMapReader(ABC):
@@ -279,7 +296,7 @@ class BasePipeline:
 
     def estimate_and_apply_geometric_transform(
         self, mkpts0: np.ndarray, mkpts1: np.ndarray, image_shape: Tuple[int, int]
-    ) -> Tuple[bool, float, np.ndarray, Optional[np.ndarray]]:
+    ) -> Tuple[bool, float, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
         """Estimate and apply a geometric transform between two sets of matched keypoints.
 
         Parameters
@@ -301,11 +318,14 @@ class BasePipeline:
             Transformed corners if the transform was applied successfully, None otherwise.
         Optional[np.ndarray]
             The homography matrix (3x3), or None if estimation failed.
+        Optional[np.ndarray]
+            The RANSAC inlier mask, or None if estimation failed.
         """
         success = False
         transformed_corners = None
         num_inliers = 0
         transformation_matrix = None
+        inlier_mask = None
 
         try:
             transformation_matrix, mask = cv2.findHomography(
@@ -316,6 +336,7 @@ class BasePipeline:
                 maxIters=self.config.homography_max_iter,
                 confidence=self.config.homography_confidence,
             )
+            inlier_mask = mask
             num_inliers = np.sum(mask)
             h, w = image_shape
 
@@ -332,7 +353,13 @@ class BasePipeline:
                 f"Failed to estimate and apply the geometric transform: {e}"
             )
 
-        return success, num_inliers, transformed_corners if success else None, transformation_matrix
+        return (
+            success,
+            num_inliers,
+            transformed_corners if success else None,
+            transformation_matrix,
+            inlier_mask,
+        )
 
     def compute_geo_pose(
         self, satellite_image: GeoSatelliteImage, matching_center: Tuple[int, int]
@@ -495,6 +522,66 @@ class BasePipeline:
         )
         return image_with_polygon
 
+    def warp_drone_to_satellite(
+        self,
+        satellite_image: np.ndarray,
+        drone_image: np.ndarray,
+        H: np.ndarray,
+        alpha: float = 0.5,
+    ) -> np.ndarray:
+        """Warp drone image onto satellite image using homography H.
+
+        Parameters
+        ----------
+        satellite_image : np.ndarray
+            satellite image (grayscale or BGR), shape (H, W) or (H, W, 3)
+        drone_image : np.ndarray
+            drone image (grayscale or BGR), shape (H, W) or (H, W, 3)
+        H : np.ndarray
+            3x3 homography matrix mapping drone pixels to satellite pixels
+        alpha : float
+            blend weight for warped drone image (0 = transparent, 1 = opaque)
+
+        Returns
+        -------
+        np.ndarray
+            satellite image with warped drone overlaid (BGR)
+        """
+        h_sat, w_sat = satellite_image.shape[:2]
+
+        # Warp drone image to satellite coordinates
+        warped = cv2.warpPerspective(
+            drone_image,
+            H,
+            (w_sat, h_sat),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+        # Ensure both images are BGR for blending
+        if len(satellite_image.shape) == 2:
+            sat_bgr = cv2.cvtColor(satellite_image, cv2.COLOR_GRAY2BGR)
+        else:
+            sat_bgr = satellite_image.copy()
+        if len(warped.shape) == 2:
+            warped_bgr = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
+        else:
+            warped_bgr = warped
+
+        # Create mask of valid warped pixels (non-black)
+        if len(warped.shape) == 3:
+            mask = (warped.max(axis=2) > 0).astype(np.uint8) * 255
+        else:
+            mask = (warped > 0).astype(np.uint8) * 255
+
+        # Alpha blend: overlay warped drone onto satellite
+        mask_f = mask.astype(np.float32) / 255.0 * alpha
+        mask_f = np.stack([mask_f] * 3, axis=-1)
+        blended = (warped_bgr * mask_f + sat_bgr * (1.0 - mask_f)).astype(np.uint8)
+
+        return blended
+
     def compute_center(self, transformed_corners: np.ndarray) -> Tuple[int, int]:
         """Compute the center of the affine transform.
 
@@ -537,7 +624,12 @@ class BasePipeline:
         cx, cy = center
         return cx / image_shape[1], cy / image_shape[0]
 
-    def draw_center(self, image: np.ndarray, center: Tuple[int, int], color: Tuple[int, int, int] = (255, 0, 255)) -> np.ndarray:
+    def draw_center(
+        self,
+        image: np.ndarray,
+        center: Tuple[int, int],
+        color: Tuple[int, int, int] = (255, 0, 255),
+    ) -> np.ndarray:
         """Draw the center of the affine transform on the image.
 
         Parameters

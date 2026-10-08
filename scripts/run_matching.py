@@ -7,8 +7,12 @@ from pathlib import Path
 from pprint import pprint
 
 from svl.keypoint_pipeline.detection_and_description import SuperPointAlgorithm
-from svl.keypoint_pipeline.matcher import SuperGlueMatcher
-from svl.keypoint_pipeline.typing import SuperGlueConfig, SuperPointConfig
+from svl.keypoint_pipeline.matcher import LightGlueMatcher, SuperGlueMatcher
+from svl.keypoint_pipeline.typing import (
+    LightGlueConfig,
+    SuperGlueConfig,
+    SuperPointConfig,
+)
 from svl.localization.drone_streamer import DroneImageStreamer
 from svl.localization.map_reader import TileSatelliteMapReader
 from svl.localization.pipeline import Pipeline, PipelineConfig
@@ -28,6 +32,8 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda", help="device for models, e.g. cuda or cpu")
     parser.add_argument("--zoom-level", type=int, default=19, help="zoom level of the tile images")
     parser.add_argument("--max-images", type=int, default=None, help="maximum number of query images to process")
+    parser.add_argument("--matcher", type=str, default="superglue", choices=["superglue", "lightglue"],
+                        help="feature matcher: superglue or lightglue")
     args = parser.parse_args()
 
     # Initialize the keypoint detector
@@ -40,13 +46,22 @@ if __name__ == "__main__":
     superpoint_algorithm = SuperPointAlgorithm(superpoint_config)
 
     # Initialize the keypoint matcher
-    superglue_config = SuperGlueConfig(
-        device=args.device,
-        weights="outdoor",
-        sinkhorn_iterations=20,
-        match_threshold=0.5,
-    )
-    superglue_matcher = SuperGlueMatcher(superglue_config)
+    if args.matcher == "lightglue":
+        matcher_config = LightGlueConfig(
+            device=args.device,
+            features="superpoint",
+            n_layers=9,
+            filter_threshold=0.5,
+        )
+        matcher = LightGlueMatcher(matcher_config)
+    else:
+        matcher_config = SuperGlueConfig(
+            device=args.device,
+            weights="outdoor",
+            sinkhorn_iterations=20,
+            match_threshold=0.5,
+        )
+        matcher = SuperGlueMatcher(matcher_config)
 
     # Initialize the map reader
     map_reader = TileSatelliteMapReader(
@@ -89,7 +104,7 @@ if __name__ == "__main__":
         map_reader=map_reader,
         drone_streamer=streamer,
         detector=superpoint_algorithm,
-        matcher=superglue_matcher,
+        matcher=matcher,
         query_processor=query_processor,
         config=PipelineConfig(),
         logger=logger,

@@ -40,6 +40,18 @@ class SuperGlueConfig(MatcherConfig):
 
 
 @dataclass
+class LightGlueConfig(MatcherConfig):
+    name: str = "LightGlue"
+    device: str = "cpu"
+    features: str = "superpoint"
+    n_layers: int = 9
+    flash: bool = True
+    depth_confidence: float = 0.95
+    width_confidence: float = 0.99
+    filter_threshold: float = 0.1
+
+
+@dataclass
 class ImageKeyPoints:
     """Class to store keypoints, descriptors, and scores for an image.
 
@@ -148,9 +160,15 @@ class ImageKeyPoints:
         self._is_torch = True
         return (
             ImageKeyPoints(
-                keypoints=torch.tensor(self.keypoints),
-                descriptors=torch.tensor(self.descriptors),
-                scores=torch.tensor(self.scores) if self.scores is not None else None,
+                keypoints=torch.as_tensor(
+                    self.keypoints, dtype=torch.float32
+                ),
+                descriptors=torch.as_tensor(
+                    self.descriptors, dtype=torch.float32
+                ),
+                scores=torch.as_tensor(self.scores, dtype=torch.float32)
+                if self.scores is not None
+                else None,
                 image_size=self.image_size,
             )
             if not self.is_torch

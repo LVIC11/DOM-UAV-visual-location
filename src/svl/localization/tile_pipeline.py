@@ -115,6 +115,7 @@ class TilePipeline(BasePipeline):
 
         max_macthes = -1
         best_dst = None
+        best_H = None
         best_denormalized_center = None
         matched_image = None
         is_match = False
@@ -157,7 +158,7 @@ class TilePipeline(BasePipeline):
                 )
                 continue
 
-            ret, num_inliers, dst, H = self.estimate_and_apply_geometric_transform(
+            ret, num_inliers, dst, H, _ = self.estimate_and_apply_geometric_transform(
                 mkpts0, mkpts1, drone_image.image.shape[:2]
             )
 
@@ -165,7 +166,13 @@ class TilePipeline(BasePipeline):
 
                 max_macthes = len(mkpts1)
                 h, w = drone_image.image.shape[:2]
-                center_pt = np.float32([[[w / 2, h / 2]]])
+                if self.config.use_centroid:
+                    # Use keypoint centroid as the query point
+                    centroid = np.mean(mkpts0, axis=0)
+                    center_pt = np.float32([[centroid]])
+                else:
+                    # Use image center as the query point
+                    center_pt = np.float32([[[w / 2, h / 2]]])
                 denormalized_center_pt = cv2.perspectiveTransform(center_pt, H)[0][0]
                 denormalized_center = (
                     int(denormalized_center_pt[0]),
@@ -174,10 +181,11 @@ class TilePipeline(BasePipeline):
                 center = self.normalize_center(
                     denormalized_center, satellite_image.image.shape
                 )
-                if center[0] < 0 or center[0] > 1 or center[1] < 0 or center[1] > 1:
+                if center[0] < -0.1 or center[0] > 1.1 or center[1] < -0.1 or center[1] > 1.1:
                     continue
 
                 best_dst = dst
+                best_H = H
                 best_denormalized_center = denormalized_center
                 matched_image = satellite_image
                 features_mean = np.mean(mkpts0, axis=0)
@@ -199,14 +207,12 @@ class TilePipeline(BasePipeline):
                 )
                 viz_path = output_path / f"{drone_image.name}_viz.jpg"
 
-                # Draw white polygon on grayscale satellite image
-                viz_satellite_image = matched_image.image.copy()
-                viz_satellite_image = self.draw_transform_polygon_on_image(
-                    viz_satellite_image, best_dst
-                )
-
-                # Build matching plot from raw grayscale images
+                # Warp drone image onto satellite image, convert to gray for matching plot
                 viz_drone_image = drone_image.image.copy()
+                viz_sat_bgr = self.warp_drone_to_satellite(
+                    matched_image.image, drone_image.image, best_H, alpha=0.6
+                )
+                viz_satellite_image = cv2.cvtColor(viz_sat_bgr, cv2.COLOR_BGR2GRAY)
                 out = make_matching_plot_fast(
                     image0=viz_drone_image,
                     image1=viz_satellite_image,

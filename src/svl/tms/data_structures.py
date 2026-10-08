@@ -427,6 +427,7 @@ class DroneImage:
 
     image_path: Path
     geo_point: GeoPoint = None
+    timestamp: float = None
     camera_orientation: Orientation = None
     drone_orientation: Orientation = None
     camera_model: CameraModel = None

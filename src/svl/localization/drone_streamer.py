@@ -123,36 +123,48 @@ class DroneImageStreamer:
             raise ValueError(f"Multiple CSV files found in {self.image_folder}")
         csv_file = csv_files[0]
         self.logger.info(f"Building image database with GT from {csv_file}")
-        self._metadata = pd.read_csv(csv_file)
+        self._metadata = pd.read_csv(csv_file, dtype=str)
+        # Normalize column names: handle both 'Filename' and 'filename'
+        col_map = {c.lower(): c for c in self._metadata.columns}
+        fname_col = col_map.get('filename', 'Filename')
+        lat_col = col_map.get('latitude', 'Latitude')
+        lon_col = col_map.get('longitude', 'Longitude')
+        alt_col = col_map.get('altitude', 'Altitude')
+        ts_col = col_map.get('timestamp', 'timestamp')
         has_orientation = all(
             col in self._metadata.columns
             for col in ["Gimball_Pitch", "Gimball_Roll", "Gimball_Yaw"]
         )
         for _, row in tqdm(self._metadata.iterrows(), total=len(self._metadata)):
-            image_path = self.image_folder / row["Filename"]
+            image_path = self.image_folder / row[fname_col]
             camera_orient = None
             drone_orient = None
             if has_orientation:
                 camera_orient = Orientation(
-                    pitch=row["Gimball_Pitch"],
-                    roll=row["Gimball_Roll"],
-                    yaw=row["Gimball_Yaw"],
+                    pitch=float(row["Gimball_Pitch"]),
+                    roll=float(row["Gimball_Roll"]),
+                    yaw=float(row["Gimball_Yaw"]),
                 )
                 if all(
                     col in self._metadata.columns
                     for col in ["Flight_Pitch", "Flight_Roll", "Flight_Yaw"]
                 ):
                     drone_orient = Orientation(
-                        pitch=row["Flight_Pitch"],
-                        roll=row["Flight_Roll"],
-                        yaw=row["Flight_Yaw"],
+                        pitch=float(row["Flight_Pitch"]),
+                        roll=float(row["Flight_Roll"]),
+                        yaw=float(row["Flight_Yaw"]),
                     )
             drone_image = DroneImage(
                 image_path=image_path,
                 geo_point=GeoPoint(
-                    latitude=row["Latitude"],
-                    longitude=row["Longitude"],
-                    altitude=row["Altitude"],
+                    latitude=float(row[lat_col]),
+                    longitude=float(row[lon_col]),
+                    altitude=float(row[alt_col]),
+                ),
+                timestamp=(
+                    float(row[ts_col])
+                    if ts_col in row and row[ts_col] not in (None, "")
+                    else None
                 ),
                 camera_orientation=camera_orient,
                 drone_orientation=drone_orient,
