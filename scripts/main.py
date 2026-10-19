@@ -82,6 +82,13 @@ if __name__ == "__main__":
         help="use keypoint centroid instead of image center for geo-pose",
     )
     parser.add_argument(
+        "--position-method",
+        choices=["planar_pnp", "homography_center"],
+        default="planar_pnp",
+        help="Use 3D planar PnP or the legacy homography image-center prediction",
+    )
+    parser.add_argument("--homography-min-inliers", type=int, default=4)
+    parser.add_argument(
         "--query-rotation-cw",
         type=float,
         default=0.0,
@@ -111,6 +118,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--gt-tile-prior-radius", type=float, default=150.0)
     args = parser.parse_args()
+    if args.homography_min_inliers < 4:
+        parser.error("--homography-min-inliers must be >=4")
     query_rotation_by_name = parse_rotation_ranges(args.query_rotation_ranges)
 
     format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -215,6 +224,8 @@ if __name__ == "__main__":
         ),
         logger=logger,
     )
+    pipeline.config.position_method = args.position_method
+    pipeline.config.homography_min_inliers = args.homography_min_inliers
     output_path = Path(args.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
     preds = pipeline.run(

@@ -76,6 +76,10 @@ def rectify_points(points, k0, d0, r0, p0):
 
 
 def convert_record(record, rectification, min_inliers):
+    if record.get("position_method", "planar_pnp") != "planar_pnp":
+        raise ValueError(
+            "This exporter assumes planar-PnP records; homography-center predictions must not be mislabeled as PnP constraints"
+        )
     width, height, _, k0, d0, r0, p0 = rectification
     source_points = record.get("keypoints", [])
     if not source_points:

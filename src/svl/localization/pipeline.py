@@ -145,10 +145,13 @@ class Pipeline(BasePipeline):
         """
         self.logger.info(f"Processing image {drone_image.name}")
 
+        position_method = getattr(self.config, "position_method", "planar_pnp")
+        if position_method not in ("planar_pnp", "homography_center"):
+            raise ValueError("Unknown position method: " + position_method)
         calibration = self.config.camera_calibration
         if calibration is None:
             raise ValueError(
-                "PipelineConfig.camera_calibration is required for planar PnP"
+                "PipelineConfig.camera_calibration is required for original-pixel export"
             )
         query_rotation_cw = self._query_rotation_for_image(drone_image.name)
         best_candidate_score = None
@@ -232,39 +235,42 @@ class Pipeline(BasePipeline):
                 query_rotation_cw,
                 calibration,
             )
-            ground_points = satellite_pixels_to_metric(
-                mkpts1,
-                satellite_image.image.shape[:2],
-                satellite_image.top_left.lat,
-                satellite_image.top_left.long,
-                satellite_image.bottom_right.lat,
-                satellite_image.bottom_right.long,
-                self.config.reference_latitude,
-                self.config.reference_longitude,
-            )
-            planar_pose = estimate_planar_pnp(
-                camera_pixels,
-                ground_points,
-                calibration,
-                min_inliers=self.config.pnp_min_inliers,
-                min_inlier_ratio=self.config.pnp_min_inlier_ratio,
-                ransac_threshold_px=self.config.pnp_ransac_threshold_px,
-                min_bbox_area_ratio=self.config.pnp_min_bbox_area_ratio,
-                min_camera_height_m=self.config.pnp_min_camera_height_m,
-                max_camera_height_m=self.config.pnp_max_camera_height_m,
-                max_optical_tilt_deg=self.config.pnp_max_optical_tilt_deg,
-                tilt_regularization_px_per_deg=(
-                    self.config.pnp_tilt_regularization_px_per_deg
-                ),
-            )
-            if planar_pose is None:
-                continue
-
-            candidate_score = (
-                planar_pose.inlier_count,
-                planar_pose.inlier_ratio,
-                -planar_pose.reprojection_mean_px,
-            )
+            planar_pose = None
+            if position_method == "planar_pnp":
+                ground_points = satellite_pixels_to_metric(
+                    mkpts1,
+                    satellite_image.image.shape[:2],
+                    satellite_image.top_left.lat,
+                    satellite_image.top_left.long,
+                    satellite_image.bottom_right.lat,
+                    satellite_image.bottom_right.long,
+                    self.config.reference_latitude,
+                    self.config.reference_longitude,
+                )
+                planar_pose = estimate_planar_pnp(
+                    camera_pixels,
+                    ground_points,
+                    calibration,
+                    min_inliers=self.config.pnp_min_inliers,
+                    min_inlier_ratio=self.config.pnp_min_inlier_ratio,
+                    ransac_threshold_px=self.config.pnp_ransac_threshold_px,
+                    min_bbox_area_ratio=self.config.pnp_min_bbox_area_ratio,
+                    min_camera_height_m=self.config.pnp_min_camera_height_m,
+                    max_camera_height_m=self.config.pnp_max_camera_height_m,
+                    max_optical_tilt_deg=self.config.pnp_max_optical_tilt_deg,
+                    tilt_regularization_px_per_deg=self.config.pnp_tilt_regularization_px_per_deg,
+                )
+                if planar_pose is None:
+                    continue
+                candidate_score = (
+                    planar_pose.inlier_count,
+                    planar_pose.inlier_ratio,
+                    -planar_pose.reprojection_mean_px,
+                )
+            else:
+                if num_inliers < getattr(self.config, "homography_min_inliers", 4):
+                    continue
+                candidate_score = (len(mkpts0), 0, 0)
             if (
                 best_candidate_score is not None
                 and candidate_score <= best_candidate_score
@@ -276,7 +282,17 @@ class Pipeline(BasePipeline):
                 center_pt = np.float32([[np.mean(mkpts0, axis=0)]])
             else:
                 center_pt = np.float32([[[w / 2, h / 2]]])
+            if position_method == "homography_center":
+                homogeneous = H @ np.array([*center_pt[0, 0], 1.0])
+                if not np.isfinite(homogeneous).all() or abs(homogeneous[2]) < 1e-9:
+                    continue
             denormalized_center_pt = cv2.perspectiveTransform(center_pt, H)[0][0]
+            if position_method == "homography_center" and not (
+                np.isfinite(denormalized_center_pt).all()
+                and 0 <= denormalized_center_pt[0] < satellite_image.image.shape[1]
+                and 0 <= denormalized_center_pt[1] < satellite_image.image.shape[0]
+            ):
+                continue
             denormalized_center = (
                 int(denormalized_center_pt[0]),
                 int(denormalized_center_pt[1]),
@@ -296,10 +312,16 @@ class Pipeline(BasePipeline):
             matched_kpts1 = mkpts1
             matched_confidence = confidence
             matched_valid = valid
-            matched_inliers = planar_pose.inlier_count
+            matched_inliers = (
+                planar_pose.inlier_count if planar_pose else int(num_inliers)
+            )
             matched_homography_inliers = int(num_inliers)
             matched_inlier_mask = inlier_mask
-            matched_pnp_inlier_mask = planar_pose.inlier_mask
+            matched_pnp_inlier_mask = (
+                planar_pose.inlier_mask
+                if planar_pose
+                else inlier_mask.ravel().astype(bool)
+            )
             matched_camera_pixels = camera_pixels
             matched_query_indices = query_indices
             matched_sat_indices = sat_indices
@@ -308,16 +330,21 @@ class Pipeline(BasePipeline):
         matched_keypoints = []
         planar_pose_dict = None
         look_at_coordinates = None
-        if best_dst is not None and best_planar_pose is not None:
-            planar_pose_dict = best_planar_pose.to_dict(
-                self.config.reference_latitude,
-                self.config.reference_longitude,
-            )
-            predicted_coordinates = GpsCoordinate(
-                lat=planar_pose_dict["camera_lat"],
-                long=planar_pose_dict["camera_lon"],
-            )
+        if best_dst is not None and (
+            best_planar_pose is not None or position_method == "homography_center"
+        ):
             look_at_coordinates = self.compute_geo_pose(matched_image, center)
+            if best_planar_pose is not None:
+                planar_pose_dict = best_planar_pose.to_dict(
+                    self.config.reference_latitude,
+                    self.config.reference_longitude,
+                )
+                predicted_coordinates = GpsCoordinate(
+                    lat=planar_pose_dict["camera_lat"],
+                    long=planar_pose_dict["camera_lon"],
+                )
+            else:
+                predicted_coordinates = look_at_coordinates
 
             distance = (
                 haversine_distance(gt_coordinates, predicted_coordinates)
@@ -385,28 +412,37 @@ class Pipeline(BasePipeline):
                     )
 
                 # Camera ground position from planar PnP (cyan ring).
-                pnp_pixel = self.gps_to_pixel(predicted_coordinates, matched_image)
-                cv2.circle(
-                    out,
-                    (pnp_pixel[0] + margin + W0, pnp_pixel[1]),
-                    10,
-                    (255, 255, 0),
-                    5,
-                    lineType=cv2.LINE_AA,
-                )
+                if best_planar_pose is not None:
+                    pnp_pixel = self.gps_to_pixel(predicted_coordinates, matched_image)
+                    cv2.circle(
+                        out,
+                        (pnp_pixel[0] + margin + W0, pnp_pixel[1]),
+                        10,
+                        (255, 255, 0),
+                        5,
+                        lineType=cv2.LINE_AA,
+                    )
 
                 # Draw text overlay
                 small_text = []
+                position_label = (
+                    "PnP camera" if best_planar_pose is not None else "H image center"
+                )
                 if gt_coordinates:
                     small_text.append(f"GT: {gt_coordinates}")
-                    small_text.append(f"PnP camera: {predicted_coordinates}")
+                    small_text.append(f"{position_label}: {predicted_coordinates}")
                     small_text.append(f"Dist: {distance*1000:.2f}m")
                 else:
-                    small_text.append(f"PnP camera: {predicted_coordinates}")
-                small_text.append(
-                    f"PnP: {matched_inliers} inliers, "
-                    f"{best_planar_pose.reprojection_mean_px:.2f}px"
-                )
+                    small_text.append(f"{position_label}: {predicted_coordinates}")
+                if best_planar_pose is not None:
+                    small_text.append(
+                        f"PnP: {matched_inliers} inliers, "
+                        f"{best_planar_pose.reprojection_mean_px:.2f}px"
+                    )
+                else:
+                    small_text.append(
+                        f"H: {matched_inliers} inliers; not a 3D camera pose"
+                    )
                 Ht = int(min(out.shape[0] / 640.0, 2.0) * 30)
                 for i, t in enumerate(small_text):
                     cv2.putText(
@@ -479,13 +515,14 @@ class Pipeline(BasePipeline):
                         "confidence": float(confidence_values[i]),
                         "homography_reprojection_error": float(reproj_errors[i]),
                         "is_homography_inlier": bool(inlier_flags[i]),
-                        "is_pnp_inlier": True,
+                        "is_pnp_inlier": best_planar_pose is not None,
                     }
                 )
         else:
             self.logger.warning(f"No match found for {drone_image.name}")
 
         return {
+            "position_method": position_method,
             "is_match": is_match,
             "gt_coordinate": gt_coordinates,
             "gt_altitude": (
@@ -573,6 +610,10 @@ class Pipeline(BasePipeline):
             )
             if pred["is_match"]:
                 record = {
+                    "position_method": pred["position_method"],
+                    "position_represents": "image_center_ground_projection_not_3d_camera_position"
+                    if pred["position_method"] == "homography_center"
+                    else "camera_position",
                     "frame": drone_image.name,
                     "timestamp": pred["timestamp"],
                     "matched_image": matched_image_name,
